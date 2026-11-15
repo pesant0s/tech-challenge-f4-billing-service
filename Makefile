@@ -7,7 +7,7 @@ VENV       := .venv
 PYTHON     ?= $(shell command -v python3.12 2>/dev/null || echo python3)
 # Delimitador `|` no sed: num Makefile, `#` abriria um comentário.
 GITHUB_OWNER ?= $(shell git config --get remote.origin.url 2>/dev/null | sed -E 's|^.*github\.com[:/]([^/]+)/.*$$|\1|')
-TESTE = DATABASE_URL="sqlite:///:memory:" SECRET_KEY="chave-de-teste-com-mais-de-32-caracteres" WEBHOOK_SECRET="webhook-secret-local"
+TESTE = MONGO_URL="mongodb://localhost:27017/?replicaSet=rs0" SECRET_KEY="chave-de-teste-com-mais-de-32-caracteres"
 
 help: ## Lista os alvos
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -15,7 +15,7 @@ help: ## Lista os alvos
 setup: ## Cria o .env a partir do .env.example, sem sobrescrever
 	@test -f .env || cp .env.example .env
 
-up: setup ## Sobe API e PostgreSQL com hot-reload (http://localhost:8000/docs)
+up: setup ## Sobe API, MongoDB e RabbitMQ com hot-reload (http://localhost:8003/docs)
 	docker compose up --build
 
 down: ## Derruba a stack local e remove os volumes
@@ -31,20 +31,20 @@ venv: ## Cria o ambiente virtual (o projeto é testado em Python 3.12)
 	$(PYTHON) -m venv $(VENV)
 	$(VENV)/bin/python -m pip install -q -r requirements.txt
 
-test: ## Roda os testes com SQLite em memória
+test: ## Roda os testes (exige o MongoDB em replica set em localhost:27017)
 	@test -x $(VENV)/bin/python || $(MAKE) --no-print-directory venv
 	$(TESTE) $(VENV)/bin/python -m pytest -q
 
 test-docker: setup ## Roda os testes dentro do container, sem Python na máquina
 	docker compose build api
-	docker compose run --rm --no-deps -e DATABASE_URL="sqlite:///:memory:" -e SECRET_KEY="chave-de-teste-com-mais-de-32-caracteres" -e WEBHOOK_SECRET="webhook-secret-local" api "python -m pytest -q -p no:cacheprovider"
+	docker compose run --rm -e MONGO_URL_TESTE="mongodb://mongo:27017/?directConnection=true" -e SECRET_KEY="chave-de-teste-com-mais-de-32-caracteres" api "python -m pytest -q -p no:cacheprovider"
 
 cov: ## Testes com cobertura
 	@test -x $(VENV)/bin/python || $(MAKE) --no-print-directory venv
 	$(TESTE) $(VENV)/bin/python -m pytest --cov=app --cov-report=term-missing --cov-report=xml
 
 build: ## Constrói a imagem localmente
-	docker build -t oficina-api:$(TAG) .
+	docker build -t billing-service:$(TAG) .
 
 render: ## Renderiza os manifestos que irão para o cluster
 	kubectl kustomize k8s/overlays/producao
@@ -55,4 +55,4 @@ kubeconfig: ## Aponta o kubectl para o cluster
 # O deploy passa sempre pelo pipeline, que publica a imagem e monta o Secret.
 implantar: ## Aciona o pipeline de deploy na main
 	@test -n "$(GITHUB_OWNER)" || { echo "Dono do repositório desconhecido: rode com GITHUB_OWNER=seu-usuario."; exit 1; }
-	gh workflow run ci-cd.yml --ref main --repo $(GITHUB_OWNER)/tech-challenge-app
+	gh workflow run ci-cd.yml --ref main --repo $(GITHUB_OWNER)/tech-challenge-f4-billing-service

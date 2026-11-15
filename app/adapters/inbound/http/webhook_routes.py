@@ -1,35 +1,32 @@
+import hashlib
 import hmac
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from app.infrastructure.database import get_db
+import logging
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+
+from app.adapters.inbound.http.dependencias import obter_servicos
 from app.infrastructure.config import settings
-from app.adapters.inbound.http.webhook_schemas import WebhookEmailPayload
-from app.adapters.inbound.http.atendimento_schemas import OSResponse
-from app.adapters.outbound.persistence.os_repository import OSRepositoryAdapter
-from app.adapters.outbound.persistence.cliente_repository import ClienteRepositoryAdapter
-from app.application.use_cases.processar_webhook_email import ProcessarWebhookEmailUseCase
 
-router = APIRouter(prefix="/webhooks", tags=["🔔 Webhooks"])
+logger = logging.getLogger("oficina.webhook")
+
+router = APIRouter(prefix="/billing", tags=["💳 Orçamento e Pagamento"])
 
 
-@router.post("/email", response_model=OSResponse,
-    summary="Webhook de resposta por e-mail",
-    description="""
-Recebe a decisão do cliente (APROVAR / REJEITAR) via link de e-mail.
-
-Autenticado por `token` comparado contra `WEBHOOK_SECRET` usando comparação
-em tempo constante (`hmac.compare_digest`) para evitar timing attacks.
-
-Não requer JWT — destinado a ser chamado pelo serviço de e-mail.
-""")
-def webhook_email(payload: WebhookEmailPayload, db: Session = Depends(get_db)):
-    # Em bytes: compare_digest recusa str com caractere fora do ASCII.
-    if not hmac.compare_digest(payload.token.encode(), settings.WEBHOOK_SECRET.encode()):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token de webhook inválido",
-        )
-    return ProcessarWebhookEmailUseCase(
-        os_repo=OSRepositoryAdapter(db),
-        cliente_repo=ClienteRepositoryAdapter(db),
-    ).executar(payload.os_id, payload.acao, payload.cpf_cnpj)
+@router.post("/webhooks/mercadopago", summary="Notificação do Mercado Pago",
+    description="Sem JWT: a autenticidade vem da assinatura `x-signature`. A situação do pedido é sempre consultada no provedor.")
+def webhook_mercadopago(corpo: dict = Body(default_factory=dict), data_id: str | None = Query(None, alias="data.id"),
+                        x_signature: str = Header(""), x_request_id: str | None = Header(None), servicos=Depends(obter_servicos)):
+    partes = dict(p.strip().split("=", 1) for p in x_signature.split(",") if "=" in p)
+    manifesto = "".join((
+        f"id:{data_id.lower() if data_id.isalnum() else data_id};" if data_id else "",
+        f"request-id:{x_request_id};" if x_request_id else "",
+        f"ts:{partes['ts']};" if "ts" in partes else "",
+    ))
+    segredo = settings.MP_WEBHOOK_SECRET
+    esperada = hmac.new(segredo.encode(), manifesto.encode(), hashlib.sha256).hexdigest() if segredo else None
+    if esperada is None or not hmac.compare_digest(esperada, partes.get("v1", "")):
+        logger.warning("Notificação com assinatura inválida", extra={"evento": "webhook_assinatura_invalida"})
+        raise HTTPException(401, "Assinatura inválida")
+    if corpo.get("type") != "order":
+        return {"processado": False}
+    return {"processado": servicos.notificacao_mercadopago.executar(data_id or corpo["data"]["id"])}
