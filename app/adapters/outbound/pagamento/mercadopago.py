@@ -8,7 +8,7 @@ import httpx
 from app.domain.dinheiro import dinheiro
 from app.domain.ports.provedor_pagamento import Cobranca, FalhaNoProvedor, SituacaoPagamento
 
-# A documentação diverge nos caminhos de cancelamento e reembolso: ajuste aqui depois de validar no sandbox.
+# Conferidos no sandbox em 14/11/2026: cancel devolve 200 (e 409 se já cancelado); refund só aceita pedido processed.
 CAMINHO_CRIAR = "/v1/orders"
 CAMINHO_PEDIDO = "/v1/orders/{id}"
 CAMINHO_CANCELAR = "/v1/orders/{id}/cancel"
