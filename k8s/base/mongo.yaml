@@ -1,0 +1,69 @@
+# MongoDB em replica set de 1 nó (transações exigem replica set). Dados em emptyDir: o ambiente é efêmero
+# e o outbox republica o que não foi confirmado.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  labels:
+    app.kubernetes.io/name: mongo
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  labels:
+    app.kubernetes.io/name: mongo
+    app.kubernetes.io/part-of: tech-challenge
+spec:
+  serviceName: mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongo
+        app.kubernetes.io/part-of: tech-challenge
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mongo
+          image: mongo:8.0
+          command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          # Inicia o replica set na primeira vez e depois só confirma que há primário. O nó se anuncia como
+          # localhost: a API conecta direto (directConnection) em vez de seguir o anúncio.
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}).ok }"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 20
+          volumeMounts:
+            - name: dados
+              mountPath: /data/db
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"
+      volumes:
+        - name: dados
+          emptyDir: {}

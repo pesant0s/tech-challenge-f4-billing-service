@@ -1,14 +1,17 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: oficina-config
+  name: billing-service-config
 data:
   ALGORITHM: "HS256"
-  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
-  ADMIN_USERNAME: "admin"
   ALLOWED_ORIGINS: '["*"]'
   LOG_FORMAT: "json"
   LOG_LEVEL: "INFO"
-  NEW_RELIC_APP_NAME: "tech-challenge-oficina"
+  MONGO_DB: "billing"
+  NEW_RELIC_APP_NAME: "tech-challenge-f4-billing-service"
   # O stdout já chega pelo nri-bundle; o encaminhamento do agente duplicaria cada linha.
   NEW_RELIC_APPLICATION_LOGGING_FORWARDING_ENABLED: "false"
+  # O pipeline troca para mercadopago quando o secret MP_ACCESS_TOKEN existe.
+  PAGAMENTO_PROVEDOR: "simulado"
+  # O API Gateway não reescreve caminhos: o Swagger sai em /billing/docs.
+  PREFIXO_DOCS: "/billing"

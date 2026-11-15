@@ -1,7 +1,7 @@
 name: CI/CD
 
-# Testes, manifestos e boot da imagem sempre; publicação e deploy só com AMBIENTE_ATIVO=true
-# (ADR-013, no tech-challenge-infra-k8s). A main só recebe código por Pull Request.
+# Testes, manifestos e boot da imagem sempre; infraestrutura, publicação e deploy só com AMBIENTE_ATIVO=true
+# (ADR-013). A main só recebe código por Pull Request. Contrato: tech-challenge-f4-plataforma/docs/infraestrutura/contrato.md.
 on:
   push:
     branches: [develop, main]
@@ -15,10 +15,10 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: oficina-api
-  EKS_CLUSTER: tech-challenge-eks
-  NAMESPACE: oficina
-  DEPLOYMENT: oficina-api
+  PREFIXO_SSM: /tech-challenge-f4
+  ECR_REPOSITORY: tech-challenge-f4-billing-service
+  NAMESPACE: billing-service
+  DEPLOYMENT: billing-service
 
 permissions:
   contents: read
@@ -102,13 +102,6 @@ jobs:
     name: Build e prova da imagem
     needs: [testes, manifestos]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      PUBLICAR: ${{ github.ref_name == 'main' && github.event_name != 'pull_request' && vars.AMBIENTE_ATIVO == 'true' }}
-    outputs:
-      imagem: ${{ steps.publicar.outputs.imagem }}
     services:
       rabbitmq:
         image: rabbitmq:4.1-alpine
@@ -125,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - run: docker build -t oficina-api:ci .
+      - run: docker build -t tech-challenge-f4-billing-service:ci .
 
       - name: MongoDB em replica set
         run: |
@@ -147,7 +140,7 @@ jobs:
             -e SECRET_KEY=chave-de-ci-com-mais-de-32-caracteres-para-teste \
             -e RABBITMQ_URL=amqp://oficina:oficina@localhost:5672/%2F \
             -e LOG_FORMAT=json \
-            oficina-api:ci
+            tech-challenge-f4-billing-service:ci
           for _ in $(seq 1 60); do
             if curl -fsS http://localhost:8000/health/ready && docker logs api 2>&1 | grep -q mensageria_conectada; then
               exit 0
@@ -158,42 +151,9 @@ jobs:
           docker logs api
           exit 1
 
-      - name: Autenticar na AWS via OIDC
-        id: aws
-        if: env.PUBLICAR == 'true'
-        continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Explicar falha de autenticação
-        if: env.PUBLICAR == 'true' && steps.aws.outcome == 'failure'
-        run: |
-          echo "::error::AMBIENTE_ATIVO=true, mas a role não pôde ser assumida: o ambiente foi destruído sem 'make down' ou falta o secret AWS_ROLE_ARN."
-          exit 1
-
-      - name: Login no ECR
-        id: ecr
-        if: env.PUBLICAR == 'true'
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
-
-      - name: Publicar no ECR
-        id: publicar
-        if: env.PUBLICAR == 'true'
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
-        run: |
-          IMAGEM="$REGISTRY/$ECR_REPOSITORY"
-          docker tag oficina-api:ci "$IMAGEM:${GITHUB_SHA::7}"
-          docker tag oficina-api:ci "$IMAGEM:latest"
-          docker push "$IMAGEM:${GITHUB_SHA::7}"
-          docker push "$IMAGEM:latest"
-          echo "imagem=$IMAGEM:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
   ambiente-desligado:
     name: Publicação e deploy não executados
-    needs: imagem
+    needs: [testes, qualidade, manifestos, imagem]
     if: github.ref_name == 'main' && github.event_name != 'pull_request' && vars.AMBIENTE_ATIVO != 'true'
     runs-on: ubuntu-latest
     steps:
@@ -201,60 +161,124 @@ jobs:
 
   deploy:
     name: Deploy no EKS
-    needs: imagem
+    needs: [testes, qualidade, manifestos, imagem]
     if: github.ref_name == 'main' && github.event_name != 'pull_request' && vars.AMBIENTE_ATIVO == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    env:
+      TEM_ROLE: ${{ secrets.AWS_ROLE_ARN != '' }}
     steps:
       - uses: actions/checkout@v4
 
+      # Conta comum: OIDC. Laboratório (AWS Academy): credenciais da sessão.
       - name: Autenticar na AWS via OIDC
-        id: aws
-        continue-on-error: true
+        if: env.TEM_ROLE == 'true'
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Explicar falha de autenticação
-        if: steps.aws.outcome == 'failure'
+      - name: Autenticar na AWS com as credenciais da sessão
+        if: env.TEM_ROLE != 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: Criar o ECR
         run: |
-          echo "::error::AMBIENTE_ATIVO=true, mas a role não pôde ser assumida: o ambiente foi destruído sem 'make down' ou falta o secret AWS_ROLE_ARN."
-          exit 1
+          CONTA=$(aws sts get-caller-identity --query Account --output text)
+          terraform -chdir=infra init -input=false \
+            -backend-config="bucket=tech-challenge-f4-tfstate-${CONTA}" -backend-config="region=${AWS_REGION}"
+          terraform -chdir=infra apply -auto-approve -input=false
 
-      - run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
-      - run: kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+      - name: Construir e publicar a imagem
+        id: publicar
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGEM="$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::7}"
+          docker build -t "$IMAGEM" .
+          docker push "$IMAGEM"
+          echo "imagem=$IMAGEM" >> "$GITHUB_OUTPUT"
 
-      # O Secret nunca é versionado: é montado a cada deploy a partir do Secrets Manager.
+      - name: Apontar o kubectl para o cluster
+        run: |
+          CLUSTER=$(aws ssm get-parameter --name "$PREFIXO_SSM/cluster/nome" --query Parameter.Value --output text)
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+
+      - name: Criar o namespace
+        run: kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      # O Secret nunca é versionado: é montado a cada deploy.
       - name: Sincronizar Secret
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MP_ACCESS_TOKEN }}
+          MP_EXTERNAL_POS_ID: ${{ secrets.MP_EXTERNAL_POS_ID }}
+          MP_WEBHOOK_SECRET: ${{ secrets.MP_WEBHOOK_SECRET }}
         run: |
-          SEGREDO=$(aws secretsmanager get-secret-value --secret-id tech-challenge/app --query SecretString --output text)
-          campo() { echo "$SEGREDO" | python3 -c "import json,sys;print(json.load(sys.stdin)['$1'])"; }
-          kubectl create secret generic oficina-secret --namespace "$NAMESPACE" \
-            --from-literal=DATABASE_URL="$(campo DATABASE_URL)" \
-            --from-literal=SECRET_KEY="$(campo SECRET_KEY)" \
-            --from-literal=ADMIN_PASSWORD="$(campo ADMIN_PASSWORD)" \
-            --from-literal=NEW_RELIC_LICENSE_KEY="${{ secrets.NEW_RELIC_LICENSE_KEY }}" \
+          ssm() { aws ssm get-parameter --name "$PREFIXO_SSM/$1" --with-decryption --query Parameter.Value --output text; }
+          SECRET_KEY=$(ssm segredos/jwt_secret_key)
+          RABBITMQ_URL=$(ssm rabbitmq/url)
+          NEW_RELIC_LICENSE_KEY=$(ssm newrelic/license_key)
+          echo "::add-mask::$SECRET_KEY"
+          echo "::add-mask::$RABBITMQ_URL"
+          [ "$NEW_RELIC_LICENSE_KEY" = "desligado" ] || echo "::add-mask::$NEW_RELIC_LICENSE_KEY"
+
+          ARGS=(
+            --from-literal=MONGO_URL="mongodb://mongo.${NAMESPACE}.svc.cluster.local:27017/?directConnection=true"
+            --from-literal=SECRET_KEY="$SECRET_KEY"
+            --from-literal=RABBITMQ_URL="$RABBITMQ_URL"
+          )
+          # Sem licença o agente fica desligado: a chave só entra se o parâmetro tiver um valor real.
+          if [ -n "$NEW_RELIC_LICENSE_KEY" ] && [ "$NEW_RELIC_LICENSE_KEY" != "desligado" ]; then
+            ARGS+=(--from-literal=NEW_RELIC_LICENSE_KEY="$NEW_RELIC_LICENSE_KEY")
+          fi
+          for chave in MP_ACCESS_TOKEN MP_EXTERNAL_POS_ID MP_WEBHOOK_SECRET; do
+            if [ -n "${!chave}" ]; then
+              ARGS+=(--from-literal="$chave=${!chave}")
+            fi
+          done
+          kubectl create secret generic billing-service-segredos --namespace "$NAMESPACE" "${ARGS[@]}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Aplicar manifestos
         env:
-          IMAGEM: ${{ needs.imagem.outputs.imagem }}
+          IMAGEM: ${{ steps.publicar.outputs.imagem }}
+          MP_ACCESS_TOKEN: ${{ secrets.MP_ACCESS_TOKEN }}
         run: |
-          (cd k8s/overlays/producao && kustomize edit set image "oficina-api=$IMAGEM")
+          # Com credencial do Mercado Pago o serviço cobra de verdade; sem ela, usa o simulador.
+          if [ -n "$MP_ACCESS_TOKEN" ]; then
+            sed -i 's/PAGAMENTO_PROVEDOR: "simulado"/PAGAMENTO_PROVEDOR: "mercadopago"/' k8s/base/configmap.yaml
+          fi
+          (cd k8s/overlays/producao && kustomize edit set image "IMAGEM_PLACEHOLDER=$IMAGEM")
           kubectl apply -k k8s/overlays/producao
+          # Secret e ConfigMap entram por variável de ambiente: só um novo pod os enxerga.
+          kubectl rollout restart "deployment/$DEPLOYMENT" -n "$NAMESPACE"
+          kubectl rollout status statefulset/mongo -n "$NAMESPACE" --timeout=300s
           kubectl rollout status "deployment/$DEPLOYMENT" -n "$NAMESPACE" --timeout=300s
 
-      - name: Smoke test
+      - name: Teste de fumaça pelo API Gateway
         run: |
-          kubectl run "smoke-test-${GITHUB_RUN_ID}" --namespace "$NAMESPACE" --rm -i --restart=Never \
-            --image=curlimages/curl:8.10.1 -- curl -fsS "http://${DEPLOYMENT}/health"
+          ENDPOINT=$(aws ssm get-parameter --name "$PREFIXO_SSM/apigateway/endpoint" --query Parameter.Value --output text)
+          # O health check do NLB leva alguns ciclos para marcar os pods como saudáveis.
+          curl -fsS --retry 12 --retry-delay 10 --retry-all-errors -o /dev/null -w "HTTP %{http_code}\n" "$ENDPOINT/billing/openapi.json"
 
       - name: Diagnóstico em caso de falha
         if: failure()
         run: |
-          kubectl get all -n "$NAMESPACE"
-          kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/name=oficina-api --tail=100 || true
+          kubectl get all -n "$NAMESPACE" || true
+          kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/name=billing-service --tail=100 || true
+          kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/name=mongo --tail=50 || true

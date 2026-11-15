@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
     LOG_FORMAT: str = "console"
     LOG_LEVEL: str = "INFO"
+    # Atrás do API Gateway o Swagger sai em /billing/docs, sem colidir com o de outros serviços.
+    PREFIXO_DOCS: str = ""
     # Sem RABBITMQ_URL a mensageria não sobe: a API atende e os eventos ficam parados no outbox.
     RABBITMQ_URL: str | None = None
     PAGAMENTO_PROVEDOR: str = "simulado"

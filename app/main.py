@@ -66,7 +66,9 @@ orçamento da própria OS.
     version="1.0.0",
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
-    redoc_url="/redoc",
+    docs_url=f"{settings.PREFIXO_DOCS}/docs",
+    redoc_url=f"{settings.PREFIXO_DOCS}/redoc",
+    openapi_url=f"{settings.PREFIXO_DOCS}/openapi.json",
 )
 
 def _erro(status_code: int, detail: str) -> JSONResponse:
