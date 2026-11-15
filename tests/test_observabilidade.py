@@ -194,3 +194,17 @@ def test_lifespan_monta_os_servicos_e_so_sobe_a_thread_com_rabbitmq(servicos, mo
     with TestClient(main.app):
         pass
     assert iniciados == [("amqp://x", servicos, main.settings.CONCILIACAO_SEGUNDOS), "start", "parar"]
+
+
+def test_prefixo_dos_docs_move_o_openapi(monkeypatch):
+    import importlib.util
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main.settings, "PREFIXO_DOCS", "/billing")
+    spec = importlib.util.spec_from_file_location("app.main_com_prefixo", main.__file__)
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    with TestClient(modulo.app) as cliente:
+        assert cliente.get("/billing/openapi.json").status_code == 200
+        assert cliente.get("/billing/docs").status_code == 200
+        assert cliente.get("/openapi.json").status_code == 404
