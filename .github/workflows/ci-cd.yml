@@ -28,17 +28,64 @@ jobs:
     name: Testes e cobertura
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: "sqlite:///:memory:"
+      MONGO_URL: "mongodb://localhost:27017/?replicaSet=rs0"
       SECRET_KEY: "chave-de-ci-com-mais-de-32-caracteres-para-teste"
-      WEBHOOK_SECRET: "webhook-secret-local"
+    # RabbitMQ real para o teste da thread de mensageria (ADR-019).
+    services:
+      rabbitmq:
+        image: rabbitmq:4.1-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: oficina
+          RABBITMQ_DEFAULT_PASS: oficina
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
+      # Service containers não aceitam `command`, e as transações exigem replica set: o MongoDB sobe por docker run.
+      - name: MongoDB em replica set
+        run: |
+          docker run -d --name mongo --publish 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          for _ in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval "1" && break
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]})"
+          for _ in $(seq 1 30); do
+            [ "$(docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary')" = "true" ] && break
+            sleep 1
+          done
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: pytest --cov=app --cov-report=term-missing -q
+      # Abaixo de 80% de cobertura o pipeline falha.
+      - run: pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cobertura
+          path: coverage.xml
+
+  qualidade:
+    name: Qualidade (SonarQube Cloud)
+    needs: testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: cobertura
+      # O quality gate do SonarQube Cloud reprova o pipeline (sonar.qualitygate.wait no sonar-project.properties).
+      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   manifestos:
     name: Validar manifestos Kubernetes
@@ -63,35 +110,48 @@ jobs:
     outputs:
       imagem: ${{ steps.publicar.outputs.imagem }}
     services:
-      postgres:
-        image: postgres:16-alpine
+      rabbitmq:
+        image: rabbitmq:4.1-alpine
         env:
-          POSTGRES_USER: oficina
-          # Com caracteres especiais, como a senha gerada em produção.
-          POSTGRES_PASSWORD: "oficina!#%"
-          POSTGRES_DB: oficina
+          RABBITMQ_DEFAULT_USER: oficina
+          RABBITMQ_DEFAULT_PASS: oficina
         ports:
-          - 5432:5432
+          - 5672:5672
         options: >-
-          --health-cmd "pg_isready -U oficina"
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
           --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+          --health-timeout 10s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
       - run: docker build -t oficina-api:ci .
 
-      # Mesmo caminho de um deploy novo: o entrypoint migra um banco vazio e sobe o servidor.
-      - name: Provar que a imagem sobe contra PostgreSQL
+      - name: MongoDB em replica set
+        run: |
+          docker run -d --name mongo --publish 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          for _ in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval "1" && break
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]})"
+          for _ in $(seq 1 30); do
+            [ "$(docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary')" = "true" ] && break
+            sleep 1
+          done
+
+      - name: Provar que a imagem sobe contra MongoDB e RabbitMQ
         run: |
           docker run -d --name api --network host \
-            -e DATABASE_URL=postgresql://oficina:oficina%21%23%25@localhost:5432/oficina \
+            -e MONGO_URL="mongodb://localhost:27017/?replicaSet=rs0" \
             -e SECRET_KEY=chave-de-ci-com-mais-de-32-caracteres-para-teste \
-            -e WEBHOOK_SECRET=ci -e LOG_FORMAT=json \
+            -e RABBITMQ_URL=amqp://oficina:oficina@localhost:5672/%2F \
+            -e LOG_FORMAT=json \
             oficina-api:ci
           for _ in $(seq 1 60); do
-            curl -fsS http://localhost:8000/health/ready && exit 0
+            if curl -fsS http://localhost:8000/health/ready && docker logs api 2>&1 | grep -q mensageria_conectada; then
+              exit 0
+            fi
             [ "$(docker inspect -f '{{.State.Running}}' api)" = "true" ] || break
             sleep 1
           done
@@ -102,7 +162,7 @@ jobs:
         id: aws
         if: env.PUBLICAR == 'true'
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -116,7 +176,7 @@ jobs:
       - name: Login no ECR
         id: ecr
         if: env.PUBLICAR == 'true'
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Publicar no ECR
         id: publicar
@@ -153,7 +213,7 @@ jobs:
       - name: Autenticar na AWS via OIDC
         id: aws
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -176,7 +236,6 @@ jobs:
           kubectl create secret generic oficina-secret --namespace "$NAMESPACE" \
             --from-literal=DATABASE_URL="$(campo DATABASE_URL)" \
             --from-literal=SECRET_KEY="$(campo SECRET_KEY)" \
-            --from-literal=WEBHOOK_SECRET="$(campo WEBHOOK_SECRET)" \
             --from-literal=ADMIN_PASSWORD="$(campo ADMIN_PASSWORD)" \
             --from-literal=NEW_RELIC_LICENSE_KEY="${{ secrets.NEW_RELIC_LICENSE_KEY }}" \
             --dry-run=client -o yaml | kubectl apply -f -
