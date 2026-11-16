@@ -35,6 +35,7 @@ def test_criar_cobranca_envia_o_pedido_do_qr_dinamico(mp):
         "type": "qr", "external_reference": "os-1", "description": "x" * 150, "total_amount": "220.00", "expiration_time": "PT15M",
         "config": {"qr": {"external_pos_id": "oficina-caixa-1", "mode": "dynamic"}},
         "transactions": {"payments": [{"amount": "220.00"}]},
+        "items": [{"title": "x" * 150, "unit_price": "220.00", "quantity": 1, "unit_measure": "unit"}],
     }
 
 
@@ -72,8 +73,17 @@ def test_consultar_mapeia_a_situacao_do_pedido(mp, pedido, esperado):
 
 def test_cancelar_devolve_a_situacao_final(mp):
     provedor, roteador = mp
-    roteador.post("/v1/orders/ORD01/cancel").respond(200, json={"status": "canceled"})
+    rota = roteador.post("/v1/orders/ORD01/cancel").respond(200, json={"status": "canceled"})
     assert provedor.cancelar("ORD01") == SituacaoPagamento.CANCELADO
+    # Sem a chave, o Mercado Pago recusa o cancelamento com 400.
+    assert rota.calls.last.request.headers["x-idempotency-key"] == "cancelar-ORD01"
+
+
+def test_cancelar_qr_vencido_devolve_expirado(mp):
+    provedor, roteador = mp
+    roteador.post("/v1/orders/ORD01/cancel").respond(409, json={"errors": [{"code": "cannot_cancel_order"}]})
+    roteador.get("/v1/orders/ORD01").respond(200, json={"status": "expired"})
+    assert provedor.cancelar("ORD01") == SituacaoPagamento.EXPIRADO
 
 
 def test_cancelar_com_conflito_consulta_a_situacao_atual(mp):

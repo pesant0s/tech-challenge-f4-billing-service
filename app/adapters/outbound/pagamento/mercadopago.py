@@ -8,7 +8,8 @@ import httpx
 from app.domain.dinheiro import dinheiro
 from app.domain.ports.provedor_pagamento import Cobranca, FalhaNoProvedor, SituacaoPagamento
 
-# Conferidos no sandbox em 14/11/2026: cancel devolve 200 (e 409 se já cancelado); refund só aceita pedido processed.
+# Conferidos no sandbox: cancel exige X-Idempotency-Key, devolve 200 e dá 409 fora de created (pago, vencido ou já
+# cancelado); refund só aceita pedido processed.
 CAMINHO_CRIAR = "/v1/orders"
 CAMINHO_PEDIDO = "/v1/orders/{id}"
 CAMINHO_CANCELAR = "/v1/orders/{id}/cancel"
@@ -49,6 +50,8 @@ class ProvedorMercadoPago:
             "expiration_time": f"PT{minutos}M",
             "config": {"qr": {"external_pos_id": self._pos_id, "mode": "dynamic"}},
             "transactions": {"payments": [{"amount": dinheiro(valor)}]},
+            # Sem itens, o app do Mercado Pago mostra "default item" ao comprador.
+            "items": [{"title": descricao[:150], "unit_price": dinheiro(valor), "quantity": 1, "unit_measure": "unit"}],
         })
         resposta.raise_for_status()
         pedido = resposta.json()
@@ -61,7 +64,8 @@ class ProvedorMercadoPago:
         return _situacao(resposta.json())
 
     def cancelar(self, provedor_ref: str) -> SituacaoPagamento:
-        resposta = self._http.post(CAMINHO_CANCELAR.format(id=provedor_ref))
+        resposta = self._http.post(CAMINHO_CANCELAR.format(id=provedor_ref),
+                                   headers={"X-Idempotency-Key": f"cancelar-{provedor_ref}"})
         if resposta.status_code == 409:
             return self.consultar(provedor_ref)
         resposta.raise_for_status()
